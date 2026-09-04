@@ -16,6 +16,8 @@ async def test_memory_proxy_adds_local_api_key_and_records_safe_event(tmp_path: 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         assert request.headers["X-API-Key"] == "local-secret"
+        assert request.headers["X-OpenViking-Account"] == "local-account"
+        assert request.headers["X-OpenViking-User"] == "local-user"
         return httpx.Response(
             200,
             json={"result": {"total": 0, "memories": []}},
@@ -30,6 +32,8 @@ async def test_memory_proxy_adds_local_api_key_and_records_safe_event(tmp_path: 
             openviking_target="ov-ark-test",
             openviking_url="http://openviking.test",
             openviking_api_key="local-secret",
+            openviking_account_id="local-account",
+            openviking_user_id="local-user",
             event_log_file=event_log,
         ),
         transport=httpx.MockTransport(handler),

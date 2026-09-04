@@ -35,6 +35,8 @@ class ArkAdapterServiceConfig:
     task_body: dict[str, Any] = field(default_factory=dict)
     existing_task_id: str = ""
     agent_id: str = "ark"
+    agent_lane_key: str = ""
+    agent_execution: dict[str, Any] = field(default_factory=dict)
     evaluator_id: str = "rollout_builtin@v1"
     task_ready_poll_interval_seconds: float = 2.0
     task_ready_timeout_seconds: float = 900.0
@@ -184,14 +186,34 @@ class ArkRunRegistry:
                         "CaseHub case(s) do not belong to the selected dataset(s): "
                         + ", ".join(mismatched_case_ids)
                     )
+                workers = request.concurrency or self._config.rollout_concurrency
                 body = {
                     "task_name": f"{self._config.task_name}_{run_id}",
                     "workflow_id": self._config.workflow_id,
                     "agent_id": self._config.agent_id,
                     "casehub_dataset_ids": task_dataset_ids,
                     "evaluator_id": self._config.evaluator_id,
-                    "workers": request.concurrency or self._config.rollout_concurrency,
+                    "workers": workers,
                 }
+                if self._config.agent_lane_key:
+                    lane_resource = await self._client.resolve_rollout_lane_resource(
+                        agent_id=self._config.agent_id,
+                        lane_key=self._config.agent_lane_key,
+                    )
+                    resource_id = str(lane_resource.get("resource_id") or "").strip()
+                    if not resource_id:
+                        raise PlatformAPIError("resolved lane resource has no resource_id")
+                    body["scheduling"] = {
+                        "resource_requests": [
+                            {
+                                "resource_id": resource_id,
+                                "amount": workers,
+                                "metadata": {},
+                            }
+                        ]
+                    }
+                if self._config.agent_execution:
+                    body["agent_execution"] = dict(self._config.agent_execution)
             created = (
                 await self._client.get_training_task(existing_task_id)
                 if is_viking_external and existing_task_id

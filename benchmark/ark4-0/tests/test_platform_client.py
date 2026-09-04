@@ -12,6 +12,26 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
     def gateway_handler(request: httpx.Request) -> httpx.Response:
         nonlocal task_reads
         assert request.headers["x-vaka-request-source"] == "ark-lx"
+        if request.method == "GET" and request.url.path == "/inspect/resources/resources":
+            assert request.url.params["applicable_agent_id"] == "ark"
+            return httpx.Response(
+                200,
+                json={
+                    "ts": 0,
+                    "data": {
+                        "resources": [
+                            {
+                                "resource_id": "rm-lane-evolving",
+                                "resource_type": "rollout_concurrency",
+                                "scope": "lane",
+                                "agent_id": "ark",
+                                "lane_key": "evolving",
+                                "enabled": True,
+                            }
+                        ]
+                    },
+                },
+            )
         if request.method == "POST" and request.url.path == "/inspect/training/tasks":
             return httpx.Response(
                 200,
@@ -112,6 +132,11 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
         transport=httpx.MockTransport(gateway_handler),
     )
     try:
+        lane = await client.resolve_rollout_lane_resource(
+            agent_id="ark",
+            lane_key="evolving",
+        )
+        assert lane["resource_id"] == "rm-lane-evolving"
         created = await client.create_training_task({"workflow_id": "ov_external_training"})
         assert created["task_id"] == "task-1"
         ready = await client.wait_for_ov_wait(

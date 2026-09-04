@@ -38,6 +38,23 @@ class CompletedPlatformClient:
         self.created_count = 0
         self.created_bodies: list[dict[str, Any]] = []
 
+    async def resolve_rollout_lane_resource(
+        self,
+        *,
+        agent_id: str,
+        lane_key: str,
+    ) -> dict[str, Any]:
+        assert agent_id == "ark"
+        assert lane_key == "evolving"
+        return {
+            "resource_id": "rm-lane-evolving",
+            "resource_type": "rollout_concurrency",
+            "scope": "lane",
+            "agent_id": agent_id,
+            "lane_key": lane_key,
+            "enabled": True,
+        }
+
     async def create_training_task(self, body: dict[str, Any]) -> dict[str, Any]:
         self.created_bodies.append(body)
         self.created_count += 1
@@ -135,6 +152,13 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
         config=ArkAdapterServiceConfig(
             dataset="ark4-0",
             domain="ark",
+            agent_lane_key="evolving",
+            agent_execution={
+                "contract_id": "ark.viking-rollout",
+                "contract_version": "3",
+                "schema_digest": "sha256:test",
+                "values": {"memory_openviking_target": "evolving-dutao"},
+            },
             rollout_concurrency=2,
             rollout_poll_interval_seconds=0.001,
             rollout_timeout_seconds=1,
@@ -160,6 +184,21 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
         assert platform_client.created_count == 1
         assert platform_client.created_bodies[0]["casehub_dataset_ids"] == ["dataset-1"]
         assert platform_client.created_bodies[0]["workers"] == 30
+        assert platform_client.created_bodies[0]["scheduling"] == {
+            "resource_requests": [
+                {
+                    "resource_id": "rm-lane-evolving",
+                    "amount": 30,
+                    "metadata": {},
+                }
+            ]
+        }
+        assert platform_client.created_bodies[0]["agent_execution"] == {
+            "contract_id": "ark.viking-rollout",
+            "contract_version": "3",
+            "schema_digest": "sha256:test",
+            "values": {"memory_openviking_target": "evolving-dutao"},
+        }
         assert start_response.json()["concurrency"] == 30
         assert start_response.json()["task_casehub_dataset_ids"] == ["dataset-1"]
         assert platform_client.created_bodies[0]["task_name"].endswith("_run-1")

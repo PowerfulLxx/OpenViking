@@ -24,6 +24,8 @@ class MemoryProxyConfig:
     openviking_target: str = ""
     openviking_url: str = "http://127.0.0.1:1933"
     openviking_api_key: str = ""
+    openviking_account_id: str = "default"
+    openviking_user_id: str = "default"
     timeout_seconds: float = 180.0
     event_log_file: Path | None = None
 
@@ -36,6 +38,10 @@ class MemoryProxyConfig:
             raise ValueError("memory_proxy.openviking_url is required when enabled")
         if not self.openviking_api_key.strip():
             raise ValueError("memory_proxy.openviking_api_key is required when enabled")
+        if not self.openviking_account_id.strip():
+            raise ValueError("memory_proxy.openviking_account_id is required when enabled")
+        if not self.openviking_user_id.strip():
+            raise ValueError("memory_proxy.openviking_user_id is required when enabled")
         if self.timeout_seconds <= 0:
             raise ValueError("memory_proxy.timeout_seconds must be > 0")
 
@@ -54,7 +60,11 @@ class LocalOpenVikingProxy:
         self._event_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             base_url=config.openviking_url.rstrip("/"),
-            headers={"X-API-Key": config.openviking_api_key},
+            headers={
+                "X-API-Key": config.openviking_api_key,
+                "X-OpenViking-Account": config.openviking_account_id,
+                "X-OpenViking-User": config.openviking_user_id,
+            },
             timeout=httpx.Timeout(config.timeout_seconds),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=40),
             transport=transport,

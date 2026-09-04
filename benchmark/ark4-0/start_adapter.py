@@ -71,6 +71,8 @@ class TrainingTaskSettings:
     task_name: str = "openviking_ark4_external_training"
     workflow_id: str = "ov_external_training"
     agent_id: str = "ark"
+    agent_lane_key: str = ""
+    agent_execution: dict[str, Any] = field(default_factory=dict)
     evaluator_id: str = "rollout_builtin@v1"
     task_body: dict[str, Any] = field(default_factory=dict)
     existing_task_id: str = ""
@@ -188,6 +190,11 @@ def load_config(path: str | Path) -> AdapterFileConfig:
             default="ov_external_training",
         ),
         agent_id=_text(task_raw.get("agent_id"), "training_task.agent_id", default="ark"),
+        agent_lane_key=_optional_text(task_raw.get("agent_lane_key")),
+        agent_execution=_any_dict(
+            task_raw.get("agent_execution"),
+            "training_task.agent_execution",
+        ),
         evaluator_id=_text(
             task_raw.get("evaluator_id"),
             "training_task.evaluator_id",
@@ -210,6 +217,17 @@ def load_config(path: str | Path) -> AdapterFileConfig:
     )
     extra_header = _any_dict(rollout_raw.get("extra_header"), "rollout.extra_header")
     _validate_extra_header(extra_header)
+    vaka_header_keys = [
+        key for key in extra_header if str(key).lower() == "x-vaka-request-source"
+    ]
+    for key in vaka_header_keys:
+        if str(extra_header[key]).strip() != platform.vaka_request_source:
+            raise ValueError(
+                "rollout.extra_header.x-vaka-request-source must match "
+                "platform.vaka_request_source"
+            )
+        del extra_header[key]
+    extra_header["x-vaka-request-source"] = platform.vaka_request_source
     rollout = RolloutSettings(
         poll_interval_seconds=_number(
             rollout_raw.get("poll_interval_seconds"),
@@ -276,6 +294,16 @@ def load_config(path: str | Path) -> AdapterFileConfig:
             default="http://127.0.0.1:1933",
         ),
         openviking_api_key=openviking_api_key,
+        openviking_account_id=_text(
+            memory_raw.get("openviking_account_id"),
+            "memory_proxy.openviking_account_id",
+            default="default",
+        ),
+        openviking_user_id=_text(
+            memory_raw.get("openviking_user_id"),
+            "memory_proxy.openviking_user_id",
+            default="default",
+        ),
         timeout_seconds=_number(
             memory_raw.get("timeout_seconds"),
             "memory_proxy.timeout_seconds",
@@ -285,6 +313,7 @@ def load_config(path: str | Path) -> AdapterFileConfig:
         event_log_file=event_log_file,
     )
     _validate_runtime_memory_target(rollout.runtime_params, memory_proxy)
+    _validate_task_memory_target(training_task.agent_execution, memory_proxy)
     return AdapterFileConfig(
         path=config_path,
         service=service,
@@ -313,6 +342,8 @@ async def run(config: AdapterFileConfig) -> None:
                 task_name=config.training_task.task_name,
                 workflow_id=config.training_task.workflow_id,
                 agent_id=config.training_task.agent_id,
+                agent_lane_key=config.training_task.agent_lane_key,
+                agent_execution=config.training_task.agent_execution,
                 evaluator_id=config.training_task.evaluator_id,
                 task_body=config.training_task.task_body,
                 existing_task_id=config.training_task.existing_task_id,
@@ -476,6 +507,25 @@ def _validate_runtime_memory_target(
     if runtime_target != memory_proxy.openviking_target:
         raise ValueError(
             "rollout.runtime_params.memory.openviking_target must equal "
+            "memory_proxy.openviking_target"
+        )
+
+
+def _validate_task_memory_target(
+    agent_execution: dict[str, Any],
+    memory_proxy: MemoryProxyConfig,
+) -> None:
+    if not memory_proxy.enabled:
+        return
+    values = agent_execution.get("values")
+    if not isinstance(values, dict):
+        raise ValueError(
+            "training_task.agent_execution.values must be configured when memory_proxy is enabled"
+        )
+    task_target = _optional_text(values.get("memory_openviking_target"))
+    if task_target != memory_proxy.openviking_target:
+        raise ValueError(
+            "training_task.agent_execution.values.memory_openviking_target must equal "
             "memory_proxy.openviking_target"
         )
 
