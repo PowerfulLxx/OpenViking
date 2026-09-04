@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from case_loader import ArkCaseRepository
+from case_loader import ArkCaseRepository, VikingCaseRepository
 
 
 class FakeCaseClient:
@@ -92,3 +92,51 @@ async def test_repository_can_load_an_explicit_case_id_without_listing() -> None
     cases = await repository.cases_for_split("test")
 
     assert [case.metadata["platform_case_id"] for case in cases] == ["case-2"]
+
+
+class FakeVikingClient:
+    async def list_rollout_source_cases(
+        self,
+        task_id: str,
+        *,
+        phase: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        assert task_id == "task-viking"
+        assert page_size == 500
+        rows = {
+            "train": [
+                {
+                    "case_id": "101",
+                    "input": {"prompt": "train prompt"},
+                    "expected_answer": "train answer",
+                    "rubric": {
+                        "name": "viking",
+                        "criteria": [{"name": "answer_score", "weight": 1.0}],
+                    },
+                    "metadata": {"viking_row_id": 101},
+                }
+            ],
+            "validation": [
+                {"case_id": "201", "input": {"prompt": "validation prompt"}}
+            ],
+        }[phase]
+        return {"phase": phase, "total": len(rows), "cases": rows if page == 1 else []}
+
+
+@pytest.mark.asyncio
+async def test_viking_repository_maps_phase_source_cases() -> None:
+    repository = VikingCaseRepository(
+        client=FakeVikingClient(),  # type: ignore[arg-type]
+        task_id="task-viking",
+        case_ids=["101"],
+    )
+
+    train_cases = await repository.cases_for_split("train")
+    validation_cases = await repository.cases_for_split("dev")
+
+    assert [case.metadata["platform_case_id"] for case in train_cases] == ["101"]
+    assert train_cases[0].metadata["viking_phase"] == "train"
+    assert train_cases[0].input["expected_answer"] == "train answer"
+    assert validation_cases == []

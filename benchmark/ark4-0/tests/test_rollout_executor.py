@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
-from rollout_executor import ArkRolloutExecutor
+from rollout_executor import ArkRolloutExecutor, RolloutBatchCoordinator
 
 from openviking.message import ToolPart
 from openviking.session.train import Case, ExecutionContext, ExperienceSet, Rubric, RubricCriterion
@@ -55,6 +56,50 @@ class FakeRolloutClient:
         }
 
 
+class FakeBatchClient:
+    def __init__(self) -> None:
+        self.submitted_bodies: list[dict[str, Any]] = []
+
+    async def submit_rollout_eval(
+        self,
+        task_id: str,
+        *,
+        body: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        assert task_id == "task-1"
+        assert idempotency_key
+        self.submitted_bodies.append(body)
+        return {
+            "batch_rollout_id": "batch-viking",
+            "case_rollouts": [
+                {"case_id": case_id, "case_rollout_id": f"rollout-{case_id}"}
+                for case_id in body["case_ids"]
+            ],
+        }
+
+    async def get_case_rollout(
+        self,
+        task_id: str,
+        case_rollout_id: str,
+    ) -> dict[str, Any]:
+        assert task_id == "task-1"
+        case_id = case_rollout_id.removeprefix("rollout-")
+        return {
+            "request_id": f"request-{case_id}",
+            "status": "completed",
+            "completion_seq": 1,
+            "result": {
+                "final_answer": "done",
+                "messages": [
+                    {"id": f"{case_id}-u", "role": "user", "content": "please do it"},
+                    {"id": f"{case_id}-a", "role": "assistant", "content": "done"},
+                ],
+                "evaluation": {"passed": True, "score": 1.0},
+            },
+        }
+
+
 def make_case() -> Case:
     return Case(
         name="case one",
@@ -74,6 +119,27 @@ def make_case() -> Case:
         ),
         metadata={"platform_case_id": "case-1"},
     )
+
+
+def make_viking_case() -> Case:
+    case = make_case()
+    case.metadata["viking_phase"] = "train"
+    return case
+
+
+def make_second_case() -> Case:
+    case = make_case()
+    case.name = "case two"
+    case.task_signature = "case-two-signature"
+    case.input["task_id"] = "case-2"
+    case.metadata["platform_case_id"] = "case-2"
+    return case
+
+
+def make_second_viking_case() -> Case:
+    case = make_second_case()
+    case.metadata["viking_phase"] = "train"
+    return case
 
 
 @pytest.mark.asyncio
@@ -143,6 +209,141 @@ async def test_executor_rejects_empty_training_trajectory_by_default() -> None:
                 metadata={"training": True, "epoch": 0},
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_executor_sends_viking_phase() -> None:
+    client = FakeRolloutClient(
+        messages=[
+            {"id": "m1", "role": "user", "content": "please do it"},
+            {"id": "m2", "role": "assistant", "content": "done"},
+        ]
+    )
+    executor = ArkRolloutExecutor(
+        client=client,  # type: ignore[arg-type]
+        platform_task_id="task-1",
+        poll_interval_seconds=0.001,
+        timeout_seconds=1,
+    )
+
+    await executor.execute(
+        [make_viking_case()],
+        ExperienceSet(root_uri="viking://user/memories/experiences", policies=[]),
+        ExecutionContext(policy_snapshot_id="snapshot-1", metadata={"training": True}),
+    )
+
+    assert client.submitted_bodies[0]["phase"] == "train"
+
+
+@pytest.mark.asyncio
+async def test_executor_submits_one_viking_batch_for_the_whole_phase() -> None:
+    client = FakeBatchClient()
+    executor = ArkRolloutExecutor(
+        client=client,  # type: ignore[arg-type]
+        platform_task_id="task-1",
+        poll_interval_seconds=0.001,
+        timeout_seconds=1,
+        concurrency=2,
+    )
+
+    rollouts = await executor.execute(
+        [make_viking_case(), make_second_viking_case()],
+        ExperienceSet(root_uri="viking://user/memories/experiences", policies=[]),
+        ExecutionContext(policy_snapshot_id="snapshot-1", metadata={"training": True}),
+    )
+
+    assert len(client.submitted_bodies) == 1
+    assert client.submitted_bodies[0]["case_ids"] == ["case-1", "case-2"]
+    assert client.submitted_bodies[0]["phase"] == "train"
+    assert client.submitted_bodies[0]["workers"] == 2
+    assert [rollout.case.name for rollout in rollouts] == ["case one", "case two"]
+
+
+@pytest.mark.asyncio
+async def test_per_case_calls_share_the_batch_recorded_by_case_query() -> None:
+    client = FakeBatchClient()
+    coordinator = RolloutBatchCoordinator()
+    first = make_case()
+    second = make_second_case()
+    descriptor = {
+        "batch_id": "query-batch-1",
+        "case_ids": ["case-1", "case-2"],
+    }
+    first.metadata["_ark_rollout_batch"] = descriptor
+    second.metadata["_ark_rollout_batch"] = descriptor
+
+    def executor() -> ArkRolloutExecutor:
+        return ArkRolloutExecutor(
+            client=client,  # type: ignore[arg-type]
+            platform_task_id="task-1",
+            poll_interval_seconds=0.001,
+            timeout_seconds=1,
+            concurrency=2,
+            batch_coordinator=coordinator,
+        )
+
+    context = ExecutionContext(
+        policy_snapshot_id="snapshot-1",
+        metadata={"training": True, "epoch": 0, "stage": "train_rollout"},
+    )
+    first_result, second_result = await asyncio.gather(
+        executor().execute(
+            [first],
+            ExperienceSet(root_uri="viking://user/memories/experiences", policies=[]),
+            context,
+        ),
+        executor().execute(
+            [second],
+            ExperienceSet(root_uri="viking://user/memories/experiences", policies=[]),
+            context,
+        ),
+    )
+
+    assert len(client.submitted_bodies) == 1
+    assert client.submitted_bodies[0]["case_ids"] == ["case-1", "case-2"]
+    assert "phase" not in client.submitted_bodies[0]
+    assert first_result[0].case.name == "case one"
+    assert second_result[0].case.name == "case two"
+
+
+@pytest.mark.asyncio
+async def test_eval_trials_create_distinct_batches() -> None:
+    client = FakeBatchClient()
+    coordinator = RolloutBatchCoordinator()
+    descriptor = {
+        "batch_id": "eval-query-batch",
+        "case_ids": ["case-1"],
+    }
+    cases = []
+    for trial in (0, 1):
+        case = make_viking_case()
+        case.metadata["viking_phase"] = "validation"
+        case.metadata["eval_trial"] = trial
+        case.metadata["_ark_rollout_batch"] = descriptor
+        cases.append(case)
+
+    executor = ArkRolloutExecutor(
+        client=client,  # type: ignore[arg-type]
+        platform_task_id="task-1",
+        poll_interval_seconds=0.001,
+        timeout_seconds=1,
+        concurrency=2,
+        batch_coordinator=coordinator,
+    )
+    context = ExecutionContext(
+        policy_snapshot_id="snapshot-1",
+        metadata={"training": False, "stage": "final_eval"},
+    )
+    await asyncio.gather(
+        *(executor.execute(
+            [case],
+            ExperienceSet(root_uri="viking://user/memories/experiences", policies=[]),
+            context,
+        ) for case in cases)
+    )
+
+    assert len(client.submitted_bodies) == 2
+    assert all(body["phase"] == "validation" for body in client.submitted_bodies)
 
 
 @pytest.mark.asyncio

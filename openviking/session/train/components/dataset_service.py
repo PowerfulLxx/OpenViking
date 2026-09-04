@@ -38,6 +38,7 @@ from openviking.session.train.domain import (
 
 CaseLoaderFactory = Callable[[str, str, str, dict[str, Any]], Any]
 RolloutExecutorFactory = Callable[[dict[str, Any]], Any]
+CasesQueriedHook = Callable[[list[Case], "CasesQueryRequest"], None]
 logger = logging.getLogger(__name__)
 _rollout_worker_state = threading.local()
 
@@ -317,6 +318,7 @@ def create_dataset_service_app(
     service_name: str,
     make_case_loader: CaseLoaderFactory,
     make_rollout_executor: RolloutExecutorFactory,
+    on_cases_queried: CasesQueriedHook | None = None,
     max_rollout_concurrency: int | None = None,
     rollout_thread_workers: int | None = None,
 ) -> FastAPI:
@@ -331,6 +333,7 @@ def create_dataset_service_app(
     app.state.service_name = service_name
     app.state.make_case_loader = make_case_loader
     app.state.make_rollout_executor = make_rollout_executor
+    app.state.on_cases_queried = on_cases_queried
     app.state.rollout_executions = RolloutExecutionStore()
     app.state.max_rollout_concurrency = max_rollout_concurrency
     app.state.rollout_semaphore = (
@@ -375,6 +378,8 @@ def create_dataset_service_app(
             cursor=request.cursor,
             limit=request.limit,
         )
+        if app.state.on_cases_queried is not None:
+            app.state.on_cases_queried(cases, request)
         next_offset = int(request.cursor or "0") + len(cases)
         next_cursor = str(next_offset) if len(cases) >= request.limit else None
         return {

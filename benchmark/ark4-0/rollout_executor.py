@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Any, Literal
@@ -23,6 +24,30 @@ from openviking.session.train import (
 )
 
 _TERMINAL_CASE_STATUSES = {"completed", "failed", "canceled", "cancelled"}
+_ROLLOUT_BATCH_METADATA_KEY = "_ark_rollout_batch"
+
+
+@dataclass(slots=True)
+class RolloutBatchCoordinator:
+    """Share one platform batch submission across per-case adapter calls."""
+
+    _submissions: dict[str, asyncio.Task[dict[str, Any]]] = field(
+        default_factory=dict,
+        init=False,
+    )
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
+
+    async def get_or_submit(
+        self,
+        key: str,
+        factory: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        async with self._lock:
+            task = self._submissions.get(key)
+            if task is None:
+                task = asyncio.create_task(factory())
+                self._submissions[key] = task
+        return await asyncio.shield(task)
 
 
 @dataclass(slots=True)
@@ -37,6 +62,7 @@ class ArkRolloutExecutor:
     idempotency_namespace: str = "openviking-ark4"
     require_messages_for_training: bool = True
     concurrency: int = 16
+    batch_coordinator: RolloutBatchCoordinator | None = None
 
     def __post_init__(self) -> None:
         if not str(self.platform_task_id or "").strip():
@@ -56,6 +82,16 @@ class ArkRolloutExecutor:
     ) -> list[Rollout]:
         del policy_set
         case_list = list(cases)
+        phases = {
+            str(case.metadata.get("viking_phase") or "").strip().lower()
+            for case in case_list
+        }
+        if (
+            len(case_list) > 1
+            and len(phases) == 1
+            and next(iter(phases)) in {"", "train", "validation"}
+        ):
+            return await self._execute_batch(case_list, context)
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def run_one(case: Case) -> Rollout:
@@ -63,6 +99,90 @@ class ArkRolloutExecutor:
                 return await self._execute_one(case, context)
 
         return list(await asyncio.gather(*(run_one(case) for case in case_list)))
+
+    async def _execute_batch(
+        self,
+        cases: list[Case],
+        context: ExecutionContext,
+    ) -> list[Rollout]:
+        phase = str(cases[0].metadata.get("viking_phase") or "").strip().lower()
+        case_by_id: dict[str, Case] = {}
+        for case in cases:
+            case_id = str(
+                case.metadata.get("platform_case_id")
+                or case.input.get("task_id")
+                or ""
+            ).strip()
+            if not case_id:
+                raise ValueError(f"case {case.name!r} has no platform_case_id")
+            if case_id in case_by_id:
+                raise ValueError(f"duplicate platform_case_id: {case_id}")
+            case_by_id[case_id] = case
+
+        connector_config = _deep_merge(
+            self.connector_config,
+            {"options": {"repeat": 1}},
+        )
+        body: dict[str, Any] = {
+            "case_ids": list(case_by_id),
+            "workers": min(self.concurrency, len(case_by_id)),
+            "connector_config": connector_config,
+            "runtime_params": dict(self.runtime_params),
+            "extra_header": dict(self.extra_header),
+        }
+        if phase:
+            body["phase"] = phase
+        idempotency_key = _idempotency_key(
+            namespace=self.idempotency_namespace,
+            task_id=self.platform_task_id,
+            case=cases[0],
+            context=context,
+            body=body,
+        )
+        submission = await self.client.submit_rollout_eval(
+            self.platform_task_id,
+            body=body,
+            idempotency_key=idempotency_key,
+        )
+        batch_rollout_id = str(submission.get("batch_rollout_id") or "")
+        handles = {
+            str(item.get("case_id") or ""): str(
+                item.get("case_rollout_id") or ""
+            )
+            for item in submission.get("case_rollouts") or []
+            if isinstance(item, dict)
+        }
+        missing = [case_id for case_id in case_by_id if not handles.get(case_id)]
+        if missing:
+            raise PlatformAPIError(
+                "batch rollout returned no handle for: "
+                + ", ".join(missing)
+            )
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def poll_one(case_id: str, case: Case) -> Rollout:
+            case_rollout_id = handles[case_id]
+            async with semaphore:
+                result = await self._poll(case_rollout_id, case=case)
+            return _rollout_from_platform_result(
+                case=case,
+                result=result,
+                policy_snapshot_id=context.policy_snapshot_id,
+                platform_task_id=self.platform_task_id,
+                batch_rollout_id=batch_rollout_id,
+                case_rollout_id=case_rollout_id,
+                require_messages=(
+                    self.require_messages_for_training
+                    and bool(context.metadata.get("training"))
+                ),
+            )
+
+        return list(
+            await asyncio.gather(
+                *(poll_one(case_id, case) for case_id, case in case_by_id.items())
+            )
+        )
 
     async def _execute_one(self, case: Case, context: ExecutionContext) -> Rollout:
         case_id = str(case.metadata.get("platform_case_id") or case.input.get("task_id") or "")
@@ -72,25 +192,58 @@ class ArkRolloutExecutor:
             self.connector_config,
             {"options": {"repeat": 1}},
         )
+        phase = str(case.metadata.get("viking_phase") or "").strip().lower()
+        if phase and phase not in {"train", "validation"}:
+            raise ValueError(f"unsupported Viking rollout phase: {phase}")
+        batch = _rollout_batch_descriptor(case)
+        batch_case_ids = batch["case_ids"] if batch is not None else [case_id]
         body = {
-            "case_ids": [case_id],
-            "workers": 1,
+            "case_ids": batch_case_ids,
+            "workers": min(self.concurrency, len(batch_case_ids)),
             "connector_config": connector_config,
             "runtime_params": dict(self.runtime_params),
             "extra_header": dict(self.extra_header),
         }
-        idempotency_key = _idempotency_key(
-            namespace=self.idempotency_namespace,
-            task_id=self.platform_task_id,
-            case=case,
-            context=context,
-            body=body,
-        )
-        submission = await self.client.submit_rollout_eval(
-            self.platform_task_id,
-            body=body,
-            idempotency_key=idempotency_key,
-        )
+        if phase:
+            body["phase"] = phase
+        if batch is not None and self.batch_coordinator is not None:
+            batch_key = _rollout_batch_execution_key(
+                platform_task_id=self.platform_task_id,
+                batch_id=batch["batch_id"],
+                phase=phase,
+                case=case,
+                context=context,
+            )
+            idempotency_key = _batch_idempotency_key(
+                namespace=self.idempotency_namespace,
+                batch_key=batch_key,
+                body=body,
+            )
+
+            async def submit_batch() -> dict[str, Any]:
+                return await self.client.submit_rollout_eval(
+                    self.platform_task_id,
+                    body=body,
+                    idempotency_key=idempotency_key,
+                )
+
+            submission = await self.batch_coordinator.get_or_submit(
+                batch_key,
+                submit_batch,
+            )
+        else:
+            idempotency_key = _idempotency_key(
+                namespace=self.idempotency_namespace,
+                task_id=self.platform_task_id,
+                case=case,
+                context=context,
+                body=body,
+            )
+            submission = await self.client.submit_rollout_eval(
+                self.platform_task_id,
+                body=body,
+                idempotency_key=idempotency_key,
+            )
         handles = submission["case_rollouts"]
         handle = next(
             (
@@ -98,7 +251,7 @@ class ArkRolloutExecutor:
                 for item in handles
                 if isinstance(item, dict) and str(item.get("case_id") or "") == case_id
             ),
-            handles[0],
+            None,
         )
         if not isinstance(handle, dict) or not str(handle.get("case_rollout_id") or ""):
             raise PlatformAPIError(f"rollout submission for case {case_id} returned no handle")
@@ -115,7 +268,6 @@ class ArkRolloutExecutor:
                 self.require_messages_for_training and bool(context.metadata.get("training"))
             ),
         )
-
     async def _poll(self, case_rollout_id: str, *, case: Case) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.timeout_seconds
@@ -149,6 +301,57 @@ class ArkRolloutExecutor:
                     f"after {self.timeout_seconds}s; status={status!r}"
                 )
             await asyncio.sleep(self.poll_interval_seconds)
+
+
+def _rollout_batch_descriptor(case: Case) -> dict[str, Any] | None:
+    raw = case.metadata.get(_ROLLOUT_BATCH_METADATA_KEY)
+    if not isinstance(raw, dict):
+        return None
+    batch_id = str(raw.get("batch_id") or "").strip()
+    values = raw.get("case_ids")
+    if not batch_id or not isinstance(values, list):
+        raise ValueError("invalid Ark rollout batch metadata")
+    case_ids = list(dict.fromkeys(str(value or "").strip() for value in values))
+    if not case_ids or any(not value for value in case_ids):
+        raise ValueError("Ark rollout batch contains an empty case id")
+    case_id = str(
+        case.metadata.get("platform_case_id") or case.input.get("task_id") or ""
+    ).strip()
+    if case_id not in case_ids:
+        raise ValueError(
+            f"case {case_id!r} is not part of Ark rollout batch {batch_id!r}"
+        )
+    return {"batch_id": batch_id, "case_ids": case_ids}
+
+
+def _rollout_batch_execution_key(
+    *,
+    platform_task_id: str,
+    batch_id: str,
+    phase: str,
+    case: Case,
+    context: ExecutionContext,
+) -> str:
+    payload = {
+        "platform_task_id": platform_task_id,
+        "batch_id": batch_id,
+        "phase": phase,
+        "policy_snapshot_id": context.policy_snapshot_id,
+        "execution_metadata": context.metadata,
+        "train_trial": case.metadata.get("train_trial"),
+        "eval_trial": case.metadata.get("eval_trial"),
+    }
+    return sha256(_safe_json(payload).encode("utf-8")).hexdigest()
+
+
+def _batch_idempotency_key(
+    *,
+    namespace: str,
+    batch_key: str,
+    body: dict[str, Any],
+) -> str:
+    digest = sha256(_safe_json(body).encode("utf-8")).hexdigest()[:24]
+    return f"{namespace}:batch:{batch_key[:24]}:{digest}"
 
 
 def _rollout_from_platform_result(

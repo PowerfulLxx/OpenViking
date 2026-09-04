@@ -123,19 +123,25 @@ class TrainingPlatformClient:
 
             status = str(task.get("status") or "").strip().lower()
             current_step = str(task.get("current_step") or "").strip()
-            ov_wait = _find_step(task.get("steps"), "OV_WAIT")
-            ov_wait_status = str((ov_wait or {}).get("status") or "").strip().lower()
-            if current_step == "OV_WAIT" and status not in _TERMINAL_TASK_STATUSES:
+            wait_steps = ("OV_WAIT", "VIKING_OV_WAIT")
+            wait_records = [_find_step(task.get("steps"), step) for step in wait_steps]
+            wait_running = any(
+                str((record or {}).get("status") or "").strip().lower() == "running"
+                for record in wait_records
+            )
+            if current_step in wait_steps and status not in _TERMINAL_TASK_STATUSES:
                 return task
-            if ov_wait_status == "running" and status not in _TERMINAL_TASK_STATUSES:
+            if wait_running and status not in _TERMINAL_TASK_STATUSES:
                 return task
             if status in _TERMINAL_TASK_STATUSES:
                 raise PlatformAPIError(
-                    f"training task {task_id} reached terminal status {status!r} before OV_WAIT"
+                    f"training task {task_id} reached terminal status {status!r} "
+                    "before its external wait node"
                 )
             if loop.time() >= deadline:
                 raise TimeoutError(
-                    f"training task {task_id} did not reach OV_WAIT within {timeout_seconds}s; "
+                    f"training task {task_id} did not reach an external wait node "
+                    f"within {timeout_seconds}s; "
                     f"last status={status!r} current_step={current_step!r}"
                 )
             await asyncio.sleep(poll_interval_seconds)
@@ -159,6 +165,27 @@ class TrainingPlatformClient:
     async def get_case(self, case_id: str) -> Any:
         response = await self._gateway.get(f"/inspect/casehub/cases/{case_id}")
         return _response_payload(response, operation=f"get CaseHub case {case_id}")
+
+    async def list_rollout_source_cases(
+        self,
+        task_id: str,
+        *,
+        phase: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        response = await self._gateway.get(
+            f"/inspect/training/tasks/{task_id}/rollout-source-cases",
+            params={"phase": phase, "page": page, "page_size": page_size},
+        )
+        return dict(
+            _unwrap_data(
+                _response_payload(
+                    response,
+                    operation=f"list {phase} rollout source cases for {task_id}",
+                )
+            )
+        )
 
     async def submit_rollout_eval(
         self,

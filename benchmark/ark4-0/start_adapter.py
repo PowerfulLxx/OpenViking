@@ -72,6 +72,8 @@ class TrainingTaskSettings:
     workflow_id: str = "ov_external_training"
     agent_id: str = "ark"
     evaluator_id: str = "rollout_builtin@v1"
+    task_body: dict[str, Any] = field(default_factory=dict)
+    existing_task_id: str = ""
     ready_poll_interval_seconds: float = 2.0
     ready_timeout_seconds: float = 900.0
 
@@ -191,6 +193,8 @@ def load_config(path: str | Path) -> AdapterFileConfig:
             "training_task.evaluator_id",
             default="rollout_builtin@v1",
         ),
+        task_body=_any_dict(task_raw.get("task_body"), "training_task.task_body"),
+        existing_task_id=_optional_text(task_raw.get("existing_task_id")),
         ready_poll_interval_seconds=_number(
             task_raw.get("ready_poll_interval_seconds"),
             "training_task.ready_poll_interval_seconds",
@@ -310,6 +314,8 @@ async def run(config: AdapterFileConfig) -> None:
                 workflow_id=config.training_task.workflow_id,
                 agent_id=config.training_task.agent_id,
                 evaluator_id=config.training_task.evaluator_id,
+                task_body=config.training_task.task_body,
+                existing_task_id=config.training_task.existing_task_id,
                 task_ready_poll_interval_seconds=(
                     config.training_task.ready_poll_interval_seconds
                 ),

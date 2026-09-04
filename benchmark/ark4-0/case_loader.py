@@ -139,8 +139,64 @@ class ArkCaseRepository:
 
 
 @dataclass(slots=True)
+class VikingCaseRepository:
+    """Load the phase-frozen source cases of ark_viking_external_training."""
+
+    client: TrainingPlatformClient
+    task_id: str
+    case_ids: list[str] = field(default_factory=list)
+    page_size: int = 500
+    _cases_by_phase: dict[str, list[Case]] = field(default_factory=dict, init=False, repr=False)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.task_id = str(self.task_id or "").strip()
+        if not self.task_id:
+            raise ValueError("task_id is required")
+        self.case_ids = list(
+            dict.fromkeys(str(item).strip() for item in self.case_ids if str(item).strip())
+        )
+        if self.page_size <= 0 or self.page_size > 500:
+            raise ValueError("page_size must be between 1 and 500")
+
+    async def cases_for_split(self, split: str) -> list[Case]:
+        phase = _viking_phase_from_split(split)
+        cached = self._cases_by_phase.get(phase)
+        if cached is not None:
+            return list(cached)
+        async with self._lock:
+            cached = self._cases_by_phase.get(phase)
+            if cached is None:
+                rows = await self._list_phase_rows(phase)
+                requested = set(self.case_ids)
+                if requested:
+                    rows = [row for row in rows if _case_id(row) in requested]
+                cached = [_case_from_viking_source(row, phase=phase) for row in rows]
+                self._cases_by_phase[phase] = cached
+        return list(cached)
+
+    async def _list_phase_rows(self, phase: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            payload = await self.client.list_rollout_source_cases(
+                self.task_id,
+                phase=phase,
+                page=page,
+                page_size=self.page_size,
+            )
+            current = [dict(item) for item in payload.get("cases") or [] if isinstance(item, dict)]
+            rows.extend(current)
+            total = int(payload.get("total") or 0)
+            if not current or len(rows) >= total:
+                break
+            page += 1
+        return rows
+
+
+@dataclass(slots=True)
 class ArkCaseLoader:
-    repository: ArkCaseRepository
+    repository: ArkCaseRepository | VikingCaseRepository
     split: str
     task_indices: list[int] | None = None
     dataset_ids: list[str] | None = None
@@ -227,6 +283,46 @@ def _case_from_detail(detail: dict[str, Any], *, split_field: str | None) -> Cas
         rubric=_rubric_from_payload(envelope, expected_answer=expected_answer),
         metadata=metadata,
     )
+
+
+def _case_from_viking_source(row: dict[str, Any], *, phase: str) -> Case:
+    case_id = _case_id(row)
+    input_payload = row.get("input")
+    input_payload = dict(input_payload) if isinstance(input_payload, dict) else {}
+    expected_payload = row.get("expected_output")
+    expected_payload = dict(expected_payload) if isinstance(expected_payload, dict) else {}
+    prompt = _find_scalar(input_payload, _PROMPT_KEYS)
+    if prompt is None:
+        prompt = _find_scalar(row, _PROMPT_KEYS)
+    if prompt is None:
+        raise PlatformAPIError(f"Viking source case {case_id} has no prompt")
+    expected_answer = row.get("expected_answer")
+    if expected_answer is None:
+        expected_answer = _find_scalar(expected_payload, _EXPECTED_ANSWER_KEYS)
+    metadata = dict(row.get("metadata") or {})
+    metadata.update(
+        {
+            "platform_case_id": case_id,
+            "platform_split": phase,
+            "viking_phase": phase,
+        }
+    )
+    return Case(
+        name=str(row.get("name") or case_id),
+        task_signature=_task_signature(row),
+        input={
+            "task_id": case_id,
+            "user_query": str(prompt),
+            **({"expected_answer": str(expected_answer)} if expected_answer is not None else {}),
+        },
+        rubric=_rubric_from_payload(row, expected_answer=expected_answer),
+        metadata=metadata,
+    )
+
+
+def _viking_phase_from_split(split: str) -> str:
+    normalized = _normalize_split(split)
+    return "train" if normalized == "train" else "validation"
 
 
 def _rubric_from_payload(envelope: dict[str, Any], *, expected_answer: Any) -> Rubric:

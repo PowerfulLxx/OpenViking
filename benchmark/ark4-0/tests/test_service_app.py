@@ -52,6 +52,25 @@ class CompletedPlatformClient:
             "envelope": {"user_query": f"hello {case_id}"},
         }
 
+    async def list_rollout_source_cases(
+        self,
+        task_id: str,
+        *,
+        phase: str,
+        page: int,
+        page_size: int,
+    ) -> dict[str, Any]:
+        assert task_id.startswith("task-")
+        rows = [
+            {
+                "case_id": "101",
+                "input": {"prompt": "viking train prompt"},
+                "expected_answer": "viking train answer",
+                "metadata": {"viking_row_id": 101},
+            }
+        ] if phase == "train" else []
+        return {"phase": phase, "page": page, "page_size": page_size, "total": len(rows), "cases": rows}
+
     async def wait_for_ov_wait(
         self,
         task_id: str,
@@ -64,7 +83,7 @@ class CompletedPlatformClient:
         return {"task_id": task_id, "status": "running", "current_step": "OV_WAIT"}
 
     async def get_training_task(self, task_id: str) -> dict[str, Any]:
-        assert task_id == "task-1"
+        assert task_id in {"task-1", "task-existing"}
         return {"task_id": task_id, "status": "running", "current_step": "OV_WAIT"}
 
     async def complete_external_training(
@@ -170,6 +189,9 @@ async def test_generic_service_contract_executes_platform_rollout() -> None:
         )
         assert case_response.status_code == 200
         assert len(case_response.json()["cases"]) == 1
+        assert case_response.json()["cases"][0]["metadata"][
+            "_ark_rollout_batch"
+        ]["case_ids"] == ["case-1"]
 
         execute_response = await client.post(
             "/v1/rollouts/execute",
@@ -267,6 +289,153 @@ async def test_each_run_has_its_own_casehub_selection() -> None:
         ["dataset-1"],
         ["dataset-2"],
     ]
+
+
+@pytest.mark.asyncio
+async def test_viking_external_run_uses_v2_task_body_and_phase_source() -> None:
+    platform_client = CompletedPlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(
+            dataset="ark4-0",
+            domain="ark",
+            workflow_id="ark_viking_external_training",
+            task_body={
+                "schema_version": "training-task-request.v2",
+                "name": "viking-external",
+                "experiment_id": "exp-external",
+                "viking_experiment_sets": [
+                    {"experiment_set_id": 371, "version": "V1", "role": "train"},
+                    {"experiment_set_id": 372, "version": "V1", "role": "eval"},
+                ],
+            },
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        response = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "viking-run",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "concurrency": 1,
+                "casehub": {"dataset_ids": ["viking"], "case_ids": ["101"]},
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["case_count"] == 1
+        assert platform_client.created_bodies[0]["name"] == "viking-external_viking-run"
+        assert "casehub_dataset_ids" not in platform_client.created_bodies[0]
+
+
+@pytest.mark.asyncio
+async def test_viking_external_run_can_attach_existing_task() -> None:
+    platform_client = CompletedPlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(
+            dataset="ark4-0",
+            domain="ark",
+            workflow_id="ark_viking_external_training",
+            existing_task_id="task-existing",
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        response = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "attached-run",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "concurrency": 1,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == "task-existing"
+    assert platform_client.created_bodies == []
+
+
+@pytest.mark.asyncio
+async def test_case_query_records_exact_requested_batch_page() -> None:
+    class ThreeCasePlatformClient(CompletedPlatformClient):
+        async def list_rollout_source_cases(
+            self,
+            task_id: str,
+            *,
+            phase: str,
+            page: int,
+            page_size: int,
+        ) -> dict[str, Any]:
+            rows = [
+                {
+                    "case_id": str(row_id),
+                    "input": {"prompt": f"prompt {row_id}"},
+                    "expected_answer": f"answer {row_id}",
+                    "metadata": {"viking_row_id": row_id},
+                }
+                for row_id in (101, 102, 103)
+            ] if phase == "train" else []
+            start = max(0, page - 1) * page_size
+            selected = rows[start : start + page_size]
+            return {
+                "phase": phase,
+                "page": page,
+                "page_size": page_size,
+                "total": len(rows),
+                "cases": selected,
+            }
+
+    platform_client = ThreeCasePlatformClient()
+    app = create_app(
+        client=platform_client,  # type: ignore[arg-type]
+        config=ArkAdapterServiceConfig(
+            dataset="ark4-0",
+            domain="ark",
+            workflow_id="ark_viking_external_training",
+            existing_task_id="task-existing",
+        ),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://adapter.test",
+    ) as client:
+        started = await client.post(
+            "/v1/runs/start",
+            json={
+                "run_id": "attached-run",
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "concurrency": 2,
+            },
+        )
+        assert started.status_code == 200
+        response = await client.post(
+            "/v1/cases/query",
+            json={
+                "dataset": "ark4-0",
+                "domain": "ark",
+                "split": "train",
+                "limit": 2,
+                "filters": {"_openviking_benchmark_run_id": "attached-run"},
+            },
+        )
+
+    assert response.status_code == 200
+    cases = response.json()["cases"]
+    assert len(cases) == 2
+    descriptors = [
+        case["metadata"]["_ark_rollout_batch"] for case in cases
+    ]
+    assert descriptors[0] == descriptors[1]
+    assert descriptors[0]["case_ids"] == ["101", "102"]
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,19 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
                 200,
                 json={"case_id": "case-1", "envelope": {"input_prompt": "hello"}},
             )
+        if request.method == "GET" and request.url.path.endswith("/rollout-source-cases"):
+            assert request.url.params["phase"] == "train"
+            return httpx.Response(
+                200,
+                json={
+                    "ts": 3,
+                    "data": {
+                        "phase": "train",
+                        "total": 1,
+                        "cases": [{"case_id": "101", "input": {"prompt": "hello"}}],
+                    },
+                },
+            )
         if request.method == "POST" and request.url.path.endswith("/rollout-eval"):
             assert request.headers["Idempotency-Key"] == "idem-1"
             return httpx.Response(
@@ -109,6 +122,10 @@ async def test_platform_client_runs_task_rollout_and_completion_flow() -> None:
         assert ready["current_step"] == "OV_WAIT"
         assert await client.list_cases(caseset_id="cs-1", dataset_id=None, limit=10, offset=0)
         assert await client.get_case("case-1")
+        source = await client.list_rollout_source_cases(
+            "task-1", phase="train", page=1, page_size=100
+        )
+        assert source["cases"][0]["case_id"] == "101"
         submission = await client.submit_rollout_eval(
             "task-1",
             body={"case_ids": ["case-1"]},
